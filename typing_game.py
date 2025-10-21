@@ -30,7 +30,6 @@ opponent_state = {
     "name": "Opponent"
 }
 game_started_event = Event()
-game_over_event = Event()
 game_text = ""
 player_name = ""
 
@@ -54,11 +53,16 @@ def on_message(client, userdata, msg):
         payload = msg.payload.decode()
         data = json.loads(payload)
 
+        # Ignore messages sent by ourselves (if broker echoes them)
+        if data.get("sender_name") == player_name:
+            return
+
         # Host receives join message with player name from client
         if data.get("action") == "join" and userdata["is_host"]:
             opponent_state["name"] = data.get("name", "Opponent")
             text_to_send = json.dumps({
                 "action": "start_game",
+                "sender_name": player_name,
                 "text": userdata["game_text"],
                 "name": player_name
             })
@@ -72,11 +76,22 @@ def on_message(client, userdata, msg):
             game_started_event.set()
 
         elif data.get("action") == "progress_update":
-            opponent_state.update(data["state"])
+            state_data = data.get("state", {})
+            # Only update running stats if the opponent isn't marked as finished yet
+            if not opponent_state["finished"]:
+                opponent_state.update(state_data)
+            # If the loser sends a final update saying they are finished, mark them as such
+            if state_data.get("finished"):
+                opponent_state["finished"] = True
 
-        elif data.get("action") == "game_over":
+        elif data.get("action") == "player_finished":
+            # The first player to send this message is the winner
             opponent_state["winner"] = True
-            game_over_event.set()
+            opponent_state["finished"] = True
+            # Update with their final, accurate stats
+            opponent_state["wpm"] = data.get("final_wpm", opponent_state["wpm"])
+            opponent_state["accuracy"] = data.get("final_accuracy", opponent_state["accuracy"])
+            opponent_state["progress"] = 100
 
     except (json.JSONDecodeError, UnicodeDecodeError):
         pass
@@ -114,7 +129,7 @@ def update_leaderboard(name, wpm, accuracy):
     save_leaderboard(leaderboard[:10]) # Keep only the top 10
 
 def draw_leaderboard(stdscr):
-    """ Renders the leaderboard on the screen. """
+    """ Renders the leaderboard on the screen and waits for a key press. """
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     leaderboard = load_leaderboard()
@@ -138,6 +153,7 @@ def draw_leaderboard(stdscr):
     
     stdscr.addstr(h - 2, (w - 24) // 2, "Press any key to exit...")
     stdscr.refresh()
+    stdscr.nodelay(False) # Wait for a key press
     stdscr.getch()
 
 # --- Curses UI and Game Logic ---
@@ -178,12 +194,20 @@ def draw_ui(stdscr, state):
     stdscr.addstr(h - 3, 4, opp_stats)
 
     if state["finished"]:
-        if opponent_state["winner"]:
-            msg = "You lose! Better luck next time."
-        else:
-             msg = "You are the winner!"
-        stdscr.addstr(h // 2, (w - len(msg)) // 2, msg, curses.A_BOLD)
-        stdscr.addstr(h // 2 + 2, (w - 36) // 2, "Game finished. Preparing leaderboard...")
+        finish_msg = f"You finished in {state['finish_time']:.2f} seconds!"
+        stdscr.addstr(h // 2 - 1, (w - len(finish_msg)) // 2, finish_msg, curses.A_BOLD)
+        
+        if not opponent_state["finished"]:
+            wait_msg = "Waiting for opponent to finish..."
+            stdscr.addstr(h // 2 + 1, (w - len(wait_msg)) // 2, wait_msg)
+        else: # Both players are finished
+            if opponent_state["winner"]:
+                msg = "You lose! Better luck next time."
+            else:
+                 msg = "You are the winner!"
+            stdscr.addstr(h // 2 + 1, (w - len(msg)) // 2, msg)
+            stdscr.addstr(h // 2 + 3, (w - 36) // 2, "Game finished. Preparing leaderboard...")
+
 
     stdscr.refresh()
 
@@ -210,17 +234,14 @@ def main_game_loop(stdscr, client, topic):
     stdscr.nodelay(True)
 
     state = {
-        "current_text": "",
-        "wpm": 0,
-        "progress": 0,
-        "accuracy": 100,
-        "start_time": None,
-        "finished": False
+        "current_text": "", "wpm": 0, "progress": 0, "accuracy": 100,
+        "start_time": None, "finished": False, "finish_time": None
     }
 
     last_update_time = 0
 
-    while not game_over_event.is_set():
+    while True:
+        # --- Handle Input (only if player hasn't finished) ---
         if not state["finished"]:
             try:
                 key = stdscr.getkey()
@@ -235,22 +256,50 @@ def main_game_loop(stdscr, client, topic):
                 
                 calculate_stats(state)
 
+                # --- Check for local win condition ---
                 if state["current_text"] == game_text:
                     state["finished"] = True
-                    win_message = json.dumps({"action": "game_over"})
-                    client.publish(topic, win_message)
-                    game_over_event.set()
+                    state["finish_time"] = time.time() - state["start_time"]
+                    calculate_stats(state) # Final calculation before sending
+                    
+                    if not opponent_state["winner"]:
+                        # We are the winner. Send the definitive "player_finished" message.
+                        win_message = json.dumps({
+                            "action": "player_finished",
+                            "sender_name": player_name,
+                            "final_wpm": state["wpm"],
+                            "final_accuracy": state["accuracy"]
+                        })
+                        client.publish(topic, win_message)
+                    else:
+                        # We are the loser. The opponent has already won.
+                        # Send a final progress update to let them know we are done.
+                        final_progress = {
+                            "action": "progress_update",
+                            "sender_name": player_name,
+                            "state": {
+                                "wpm": state["wpm"],
+                                "progress": 100,
+                                "accuracy": state["accuracy"],
+                                "finished": True # This is the crucial flag for the winner
+                            }
+                        }
+                        client.publish(topic, json.dumps(final_progress))
 
             except curses.error:
-                pass
-        else:
-             # This block is now effectively unused as game_over_event controls the loop
-            pass
+                pass # No input
 
+        # --- Check for game over condition for BOTH players ---
+        if state["finished"] and opponent_state["finished"]:
+            break # Exit the main loop
+
+        # --- Send periodic progress updates ---
         if time.time() - last_update_time > 0.2:
-            calculate_stats(state)
-            progress_data = {
-                "action": "progress_update",
+            if not state["finished"]: # Don't send updates after finishing
+                calculate_stats(state)
+            
+            progress_data = { "action": "progress_update",
+                "sender_name": player_name,
                 "state": { "wpm": state["wpm"], "progress": state["progress"], "accuracy": state["accuracy"] }
             }
             client.publish(topic, json.dumps(progress_data))
@@ -259,9 +308,7 @@ def main_game_loop(stdscr, client, topic):
         draw_ui(stdscr, state)
         time.sleep(0.01)
     
-    # --- Game Over Sequence ---
-    state["finished"] = True
-    calculate_stats(state) # Final calculation
+    # --- Game Over Sequence (after loop breaks) ---
     draw_ui(stdscr, state) # Show final win/loss message
     time.sleep(2)
 
@@ -270,14 +317,12 @@ def main_game_loop(stdscr, client, topic):
         update_leaderboard(player_name, state["wpm"], state["accuracy"])
 
     client.disconnect()
-    # Show leaderboard before exiting
     draw_leaderboard(stdscr)
 
 def main(stdscr):
     """ Main entry point to get player name, set up connection, and start the game. """
     global game_text, player_name
     
-    # Get Player Name
     curses.echo()
     stdscr.clear()
     stdscr.addstr(0, 0, "Enter your name (max 15 chars):")
@@ -335,7 +380,7 @@ def main(stdscr):
     if is_host:
         game_started_event.wait(timeout=120)
     else:
-        join_msg = json.dumps({"action": "join", "name": player_name})
+        join_msg = json.dumps({"action": "join", "name": player_name, "sender_name": player_name})
         client.publish(topic, join_msg)
         game_started_event.wait(timeout=120)
 
