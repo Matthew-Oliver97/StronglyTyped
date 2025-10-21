@@ -1,37 +1,56 @@
 #!/bin/bash
 
-# This script automates the setup and execution of the P2P typing game.
-# It ensures a clean environment by recreating the virtual environment on each run.
+# This script automates the setup and execution of the typing game for macOS and Linux.
+# It intelligently finds the Python command, creates a clean virtual environment,
+# installs dependencies, and runs the game.
 
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
 # --- Configuration ---
-# The name of the virtual environment directory.
-VENV_DIR="wormhole_venv"
-# The Python script to run.
+VENV_DIR="game_venv"
 GAME_SCRIPT="typing_game.py"
-# The path to the Homebrew Python interpreter (for Apple Silicon Macs).
-# If you have an Intel Mac, change this to /usr/local/bin/python3
-PYTHON_CMD="/opt/homebrew/bin/python3"
+PYTHON_CMD=""
 
+# --- Platform Detection and Python Command Discovery ---
+echo "Detecting platform and finding Python 3..."
+
+# Check if running on macOS
+if [[ "$(uname)" == "Darwin" ]]; then
+    # On macOS, prioritize Homebrew's Python
+    if command -v brew &> /dev/null; then
+        # Check for Apple Silicon path first
+        if [ -x "/opt/homebrew/bin/python3" ]; then
+            PYTHON_CMD="/opt/homebrew/bin/python3"
+        # Check for Intel path
+        elif [ -x "/usr/local/bin/python3" ]; then
+            PYTHON_CMD="/usr/local/bin/python3"
+        fi
+    fi
+fi
+
+# If no specific path was found (or not on macOS), fall back to the default python3
+if [ -z "$PYTHON_CMD" ]; then
+    if command -v python3 &> /dev/null; then
+        PYTHON_CMD="python3"
+    else
+        echo "Error: python3 command not found."
+        echo "Please install Python 3 and make sure it is in your system's PATH."
+        exit 1
+    fi
+fi
+
+echo "Using Python interpreter at: $($PYTHON_CMD -c 'import sys; print(sys.executable)')"
 
 # --- Script Logic ---
 
-# 1. Check if the Homebrew Python command exists.
-if ! command -v "$PYTHON_CMD" &> /dev/null; then
-    echo "Error: Homebrew Python not found at '$PYTHON_CMD'"
-    echo "Please make sure Homebrew is installed and you've run 'brew install python3'."
-    exit 1
-fi
-
-# 2. Force a clean slate by removing the old virtual environment if it exists.
+# 1. Force a clean slate by removing the old virtual environment if it exists.
 if [ -d "$VENV_DIR" ]; then
     echo "Removing existing virtual environment for a clean start..."
     rm -rf "$VENV_DIR"
 fi
 
-# 3. Create a new virtual environment.
+# 2. Create a new virtual environment.
 echo "Creating a fresh Python virtual environment..."
 "$PYTHON_CMD" -m venv "$VENV_DIR"
 
@@ -39,15 +58,13 @@ echo "Creating a fresh Python virtual environment..."
 VENV_PYTHON="$VENV_DIR/bin/python"
 VENV_PIP="$VENV_DIR/bin/pip"
 
-# 4. Install the required package into the new environment.
-# Since we create a fresh venv every time, we always need to install.
+# 3. Install the required package into the new environment.
 echo "Installing 'paho-mqtt' package..."
 "$VENV_PIP" install paho-mqtt
 
-# 5. Run the game using the explicit path to the venv's Python interpreter.
-echo "Starting the typing game..."
+# 4. Run the game using the explicit path to the venv's Python interpreter.
+echo "Starting Terminal Velocity..."
 "$VENV_PYTHON" "$GAME_SCRIPT"
 
-# 6. No 'deactivate' is needed because we didn't 'source' the 'activate' script.
 echo "Game has ended."
 
